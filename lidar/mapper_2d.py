@@ -68,6 +68,10 @@ class Mapper2D:
         self.external_yaw_fresh = False
         self._external_yaw_raw_rad: float | None = None
         self._external_yaw_offset_rad: float | None = None
+        self._wall_anchor_phi_world_rad: float | None = None
+        self._wall_anchor_rho_world_m: float | None = None
+        self._wall_anchor_miss_count = 0
+        self.wall_anchor_score = 0.0
 
         self.scan_count = 0
 
@@ -124,12 +128,14 @@ class Mapper2D:
 
         local_x = dists * np.cos(angles)
         local_y = dists * np.sin(angles)
+        wall_line = self._extract_wall_line(local_x, local_y)
+        self.wall_anchor_score = 0.0 if wall_line is None else float(wall_line[2])
 
         external_yaw = self._get_external_yaw_world_rad()
         if external_yaw is not None:
             self.sensor_yaw_rad = external_yaw
 
-        self._localize_against_map(local_x, local_y)
+        self._localize_against_map(local_x, local_y, wall_line)
 
         if not self._should_integrate_scan():
             self.integration_frozen = True
@@ -199,9 +205,15 @@ class Mapper2D:
         visited = self._visited
         self.grid[visited] = (1.0 / (1.0 + np.exp(-self._log_odds[visited]))) * 100.0
 
+        self._update_wall_anchor(wall_line)
         self.scan_count += 1
 
-    def _localize_against_map(self, local_x: np.ndarray, local_y: np.ndarray) -> None:
+    def _localize_against_map(
+        self,
+        local_x: np.ndarray,
+        local_y: np.ndarray,
+        wall_line: tuple[float, float, float] | None = None,
+    ) -> None:
         """Correlative scan matching against the accumulated map (lightweight 2-D SLAM step)."""
         external_yaw = self._get_external_yaw_world_rad()
 
@@ -251,6 +263,8 @@ class Mapper2D:
             self.origin_gx,
             self.origin_gy,
             inv_res,
+            wall_line=wall_line,
+            wall_anchor=self._get_wall_anchor(),
         )
         if best_pose is None:
             return
@@ -276,6 +290,8 @@ class Mapper2D:
             self.origin_gy,
             inv_res,
             anchor_xy=(x0, y0),
+            wall_line=wall_line,
+            wall_anchor=self._get_wall_anchor(),
         )
         if best_pose_2 is None:
             return
@@ -319,6 +335,54 @@ class Mapper2D:
             return None
         return self._wrap_angle(self._external_yaw_raw_rad + self._external_yaw_offset_rad)
 
+    def _get_wall_anchor(self) -> tuple[float, float] | None:
+        if self._wall_anchor_phi_world_rad is None or self._wall_anchor_rho_world_m is None:
+            return None
+        return (self._wall_anchor_phi_world_rad, self._wall_anchor_rho_world_m)
+
+    def _update_wall_anchor(self, wall_line: tuple[float, float, float] | None) -> None:
+        if wall_line is None:
+            self._wall_anchor_miss_count += 1
+            if self._wall_anchor_miss_count >= 25:
+                self._wall_anchor_phi_world_rad = None
+                self._wall_anchor_rho_world_m = None
+            return
+
+        phi_local, rho_local, quality = wall_line
+        if quality < 20.0:
+            self._wall_anchor_miss_count += 1
+            return
+
+        phi_world, rho_world = self._line_local_to_world(
+            phi_local,
+            rho_local,
+            self.sensor_yaw_rad,
+            self.sensor_x_m,
+            self.sensor_y_m,
+        )
+
+        if self._wall_anchor_phi_world_rad is None or self._wall_anchor_rho_world_m is None:
+            self._wall_anchor_phi_world_rad = phi_world
+            self._wall_anchor_rho_world_m = rho_world
+            self._wall_anchor_miss_count = 0
+            return
+
+        angle_err = self._line_angle_diff(phi_world, self._wall_anchor_phi_world_rad)
+        rho_err = abs(rho_world - self._wall_anchor_rho_world_m)
+        if angle_err <= math.radians(6.0) and rho_err <= 0.25:
+            alpha = 0.25
+            self._wall_anchor_phi_world_rad = self._blend_line_angle(
+                self._wall_anchor_phi_world_rad,
+                phi_world,
+                alpha,
+            )
+            self._wall_anchor_rho_world_m = (
+                (1.0 - alpha) * self._wall_anchor_rho_world_m + alpha * rho_world
+            )
+            self._wall_anchor_miss_count = 0
+        else:
+            self._wall_anchor_miss_count += 1
+
     def _should_integrate_scan(self) -> bool:
         if self.scan_count < 12:
             return True
@@ -331,6 +395,112 @@ class Mapper2D:
     @staticmethod
     def _wrap_angle(angle_rad: float) -> float:
         return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+
+    @classmethod
+    def _wrap_line_angle(cls, angle_rad: float) -> float:
+        wrapped = cls._wrap_angle(angle_rad)
+        if wrapped < 0.0:
+            wrapped += math.pi
+        if wrapped >= math.pi:
+            wrapped -= math.pi
+        return wrapped
+
+    @classmethod
+    def _line_angle_diff(cls, a_rad: float, b_rad: float) -> float:
+        diff = abs(cls._wrap_line_angle(a_rad) - cls._wrap_line_angle(b_rad))
+        return min(diff, math.pi - diff)
+
+    @classmethod
+    def _blend_line_angle(cls, base_rad: float, new_rad: float, alpha: float) -> float:
+        base = cls._wrap_line_angle(base_rad)
+        new = cls._wrap_line_angle(new_rad)
+        delta = cls._wrap_angle(new - base)
+        if delta > math.pi / 2:
+            delta -= math.pi
+        elif delta < -math.pi / 2:
+            delta += math.pi
+        return cls._wrap_line_angle(base + alpha * delta)
+
+    @classmethod
+    def _canonical_line(cls, phi_rad: float, rho_m: float) -> tuple[float, float]:
+        phi = cls._wrap_angle(phi_rad)
+        rho = float(rho_m)
+        if rho < 0.0:
+            rho = -rho
+            phi = cls._wrap_angle(phi + math.pi)
+        return cls._wrap_line_angle(phi), rho
+
+    @classmethod
+    def _line_local_to_world(
+        cls,
+        phi_local_rad: float,
+        rho_local_m: float,
+        yaw_world_rad: float,
+        x_world_m: float,
+        y_world_m: float,
+    ) -> tuple[float, float]:
+        phi_world = cls._wrap_angle(phi_local_rad + yaw_world_rad)
+        rho_world = rho_local_m + x_world_m * math.cos(phi_world) + y_world_m * math.sin(phi_world)
+        return cls._canonical_line(phi_world, rho_world)
+
+    @classmethod
+    def _extract_wall_line(
+        cls,
+        local_x: np.ndarray,
+        local_y: np.ndarray,
+    ) -> tuple[float, float, float] | None:
+        if local_x.size < 24:
+            return None
+
+        pts = np.column_stack((local_x, local_y)).astype(np.float32, copy=False)
+        if pts.shape[0] < 24:
+            return None
+
+        jumps = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        split_idx = np.nonzero(jumps > 0.30)[0] + 1
+        segments = np.split(pts, split_idx)
+
+        best: tuple[float, float, float] | None = None
+        best_score = -1.0
+        for seg in segments:
+            if seg.shape[0] < 18:
+                continue
+
+            window_size = min(36, seg.shape[0])
+            step = max(4, window_size // 6)
+            for start in range(0, max(1, seg.shape[0] - window_size + 1), step):
+                window = seg[start:start + window_size]
+                if window.shape[0] < 18:
+                    continue
+
+                centroid = np.mean(window, axis=0)
+                centered = window - centroid
+                cov = centered.T @ centered / max(1, window.shape[0] - 1)
+                eigvals, eigvecs = np.linalg.eigh(cov)
+                order = np.argsort(eigvals)
+                normal = eigvecs[:, order[0]]
+
+                rho = float(np.dot(centroid, normal))
+                if rho < 0.0:
+                    rho = -rho
+                    normal = -normal
+
+                residuals = np.abs(window @ normal - rho)
+                mean_res = float(np.mean(residuals))
+                inlier_ratio = float(np.mean(residuals < 0.06))
+                span = float(np.linalg.norm(window[-1] - window[0]))
+                if span < 0.8 or inlier_ratio < 0.82 or mean_res > 0.07:
+                    continue
+
+                score = span * window.shape[0] * inlier_ratio / max(0.02, mean_res)
+                if score <= best_score:
+                    continue
+
+                phi = math.atan2(float(normal[1]), float(normal[0]))
+                best_score = score
+                best = cls._canonical_line(phi, rho) + (float(score),)
+
+        return best
 
     @staticmethod
     def _search_pose(
@@ -346,6 +516,8 @@ class Mapper2D:
         origin_gy: int,
         inv_res: float,
         anchor_xy: tuple[float, float] | None = None,
+        wall_line: tuple[float, float, float] | None = None,
+        wall_anchor: tuple[float, float] | None = None,
     ) -> tuple[float, tuple[float, float, float] | None]:
         best_score = -1e9
         best_pose = None
@@ -383,6 +555,28 @@ class Mapper2D:
                     score += 12.0 * float(np.mean(hit_vals >= 4))
                     score += 6.0 * float(np.mean(hit_vals >= 8))
 
+                    if wall_line is not None and wall_anchor is not None:
+                        phi_local, rho_local, quality = wall_line
+                        anchor_phi, anchor_rho = wall_anchor
+                        phi_world, rho_world = Mapper2D._line_local_to_world(
+                            phi_local,
+                            rho_local,
+                            float(yaw),
+                            float(x),
+                            float(y),
+                        )
+                        angle_err = Mapper2D._line_angle_diff(phi_world, anchor_phi)
+                        rho_err = abs(rho_world - anchor_rho)
+                        angle_gate = math.radians(12.0)
+                        rho_gate = 0.45
+                        if angle_err <= angle_gate and rho_err <= rho_gate:
+                            score += min(36.0, quality * 0.06)
+                            score += 18.0 * (1.0 - angle_err / angle_gate)
+                            score += 12.0 * (1.0 - rho_err / rho_gate)
+                        else:
+                            score -= 10.0 + 25.0 * min(1.0, angle_err / math.radians(20.0))
+                            score -= 15.0 * min(1.0, rho_err / 0.75)
+
                     if score > best_score:
                         best_score = score
                         best_pose = (float(yaw), float(x), float(y))
@@ -419,3 +613,7 @@ class Mapper2D:
         self.external_yaw_fresh = False
         self._external_yaw_raw_rad = None
         self._external_yaw_offset_rad = None
+        self._wall_anchor_phi_world_rad = None
+        self._wall_anchor_rho_world_m = None
+        self._wall_anchor_miss_count = 0
+        self.wall_anchor_score = 0.0
